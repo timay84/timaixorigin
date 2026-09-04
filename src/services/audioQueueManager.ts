@@ -27,6 +27,8 @@ export class AudioQueueManager {
   private isPlaying = false;
   private animationFrameId: number | null = null;
   private dataArray: Uint8Array;
+  private generation = 0;
+  private destroyed = false;
 
   onAmplitude: AmplitudeCallback | null = null;
   onQueueStart: QueueEventCallback | null = null;
@@ -55,7 +57,12 @@ export class AudioQueueManager {
    * Decode an ArrayBuffer into an AudioBuffer and enqueue it.
    */
   async enqueue(buffer: ArrayBuffer, text: string, emotion?: string): Promise<void> {
+    const generation = this.generation;
     const audioBuffer = await this.context.decodeAudioData(buffer.slice(0));
+
+    // An interrupted decode may finish after the queue was cleared.
+    if (this.destroyed || generation !== this.generation) return;
+
     this.queue.push({ buffer: audioBuffer, text, emotion });
     if (!this.isPlaying) {
       this.playNext();
@@ -94,7 +101,11 @@ export class AudioQueueManager {
   }
 
   private startAmplitudeTracking(): void {
+    if (this.animationFrameId !== null) return;
+
     const track = () => {
+      if (this.animationFrameId === null) return;
+
       this.analyser.getByteTimeDomainData(this.dataArray);
       let sum = 0;
       for (let i = 0; i < this.dataArray.length; i++) {
@@ -105,7 +116,7 @@ export class AudioQueueManager {
       if (this.onAmplitude) this.onAmplitude(rms);
       this.animationFrameId = requestAnimationFrame(track);
     };
-    track();
+    this.animationFrameId = requestAnimationFrame(track);
   }
 
   private stopAmplitudeTracking(): void {
@@ -120,6 +131,7 @@ export class AudioQueueManager {
    * Immediately stop all playback, clear the queue, and reset amplitude.
    */
   interrupt(): void {
+    this.generation += 1;
     if (this.currentSource) {
       try {
         this.currentSource.onended = null;
@@ -133,6 +145,18 @@ export class AudioQueueManager {
     this.queue = [];
     this.isPlaying = false;
     this.stopAmplitudeTracking();
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.interrupt();
+    this.analyser.disconnect();
+    this.gainNode.disconnect();
+    this.onAmplitude = null;
+    this.onQueueStart = null;
+    this.onQueueComplete = null;
+    this.onItemStart = null;
   }
 
   get queueLength(): number {

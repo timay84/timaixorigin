@@ -27,6 +27,7 @@ export default function App() {
   const queueManagerRef = useRef<AudioQueueManager | null>(null);
   const chunkerRef = useRef<TextChunker | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const conversationIdRef = useRef(0);
   const emotionTimeoutRef = useRef<number | null>(null);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -84,6 +85,9 @@ export default function App() {
   }, [handleAmplitude, handleQueueStart, handleQueueComplete, handleItemStart]);
 
   const handleInterrupt = useCallback(() => {
+    // Invalidate every callback and TTS result belonging to the old turn.
+    conversationIdRef.current += 1;
+
     // Clear audio queue
     if (queueManagerRef.current) {
       queueManagerRef.current.interrupt();
@@ -103,6 +107,7 @@ export default function App() {
     // Stop streaming state
     setIsStreaming(false);
     setIsSpeaking(false);
+    setSubtitleText('');
     mouthTargetRef.current = 0;
 
     // Trigger surprised emotion
@@ -124,7 +129,9 @@ export default function App() {
   }, []);
 
   const handleChunk = useCallback(
-    async (chunk: string) => {
+    async (chunk: string, conversationId: number, signal: AbortSignal) => {
+      if (conversationId !== conversationIdRef.current || signal.aborted) return;
+
       const manager = queueManagerRef.current;
       if (!manager) return;
 
@@ -151,10 +158,16 @@ export default function App() {
 
       // Synthesize and enqueue
       try {
-        const result = await synthesize(chunk, settingsRef.current.ttsApiKey || undefined);
+        const result = await synthesize(
+          chunk,
+          settingsRef.current.ttsApiKey || undefined,
+          signal,
+        );
+
+        if (conversationId !== conversationIdRef.current || signal.aborted) return;
         await manager.enqueue(result.buffer, chunk, result.emotion);
       } catch (err) {
-        console.error('TTS synthesis failed:', err);
+        if (!signal.aborted) console.error('TTS synthesis failed:', err);
       }
     },
     [],
@@ -167,29 +180,37 @@ export default function App() {
     setIsStreaming(true);
     setEmotion('speaking');
 
-    // Create a fresh chunker for this conversation
-    const chunker = new TextChunker((chunk) => {
-      void handleChunk(chunk);
-    });
-    chunkerRef.current = chunker;
-
+    const conversationId = conversationIdRef.current + 1;
+    conversationIdRef.current = conversationId;
     const controller = new AbortController();
     abortRef.current = controller;
 
-    await streamText({
-      onChunk: (llmChunk) => {
-        if (controller.signal.aborted) return;
-        chunker.add(llmChunk.text);
-        if (llmChunk.done) {
-          chunker.flush();
-        }
-      },
-      signal: controller.signal,
+    // Create a fresh chunker for this conversation
+    const chunker = new TextChunker((chunk) => {
+      void handleChunk(chunk, conversationId, controller.signal);
     });
+    chunkerRef.current = chunker;
 
-    if (!controller.signal.aborted) {
-      chunker.flush();
-      setIsStreaming(false);
+    try {
+      await streamText({
+        onChunk: (llmChunk) => {
+          if (controller.signal.aborted || conversationId !== conversationIdRef.current) return;
+          chunker.add(llmChunk.text);
+          if (llmChunk.done) chunker.flush();
+        },
+        signal: controller.signal,
+      });
+
+      if (!controller.signal.aborted && conversationId === conversationIdRef.current) {
+        chunker.flush();
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) console.error('LLM stream failed:', err);
+    } finally {
+      if (conversationId === conversationIdRef.current) {
+        setIsStreaming(false);
+        if (abortRef.current === controller) abortRef.current = null;
+      }
     }
   }, [isStreaming, isSpeaking, handleChunk]);
 
@@ -198,6 +219,7 @@ export default function App() {
     return () => {
       if (emotionTimeoutRef.current) clearTimeout(emotionTimeoutRef.current);
       if (abortRef.current) abortRef.current.abort();
+      queueManagerRef.current?.destroy();
       if (audioCtxRef.current) audioCtxRef.current.close();
     };
   }, []);

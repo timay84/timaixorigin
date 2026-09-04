@@ -33,7 +33,17 @@ function pickFreq(): number {
  * @param text  The text to "speak"
  * @param apiKey  Reserved for real TTS integration (unused in mock)
  */
-export async function synthesize(text: string, apiKey?: string): Promise<TTSResult> {
+export async function synthesize(
+  text: string,
+  apiKey?: string,
+  signal?: AbortSignal,
+): Promise<TTSResult> {
+  // The mock does not use the key, but keep the parameter for the real API swap.
+  void apiKey;
+  if (signal?.aborted) {
+    throw new DOMException('TTS request was aborted', 'AbortError');
+  }
+
   // Detect emotion tags
   const laughMatch = text.match(/\[laugh\]/i);
   const cryMatch = text.match(/\[cry\]/i);
